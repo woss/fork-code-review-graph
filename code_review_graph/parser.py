@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple, Optional
 
+import tree_sitter
 import tree_sitter_language_pack as tslp
 
 from .tsconfig_resolver import TsconfigResolver
@@ -2235,7 +2236,7 @@ class CodeParser:
 
     def _extract_terraform_blocks(
         self,
-        tree: "tree_sitter.Tree",
+        tree: tree_sitter.Tree,
         language: str,
         file_path: str,
         nodes: list[NodeInfo],
@@ -2375,7 +2376,7 @@ class CodeParser:
                         # Get the literal value from expression
                         # Handle both direct string_literal and nested structures
                         attr_value = self._extract_terraform_string_value(sub)
-                
+
                 if attr_name == "source" and attr_value:
                     # Create IMPORTS_FROM edge for module source
                     edges.append(EdgeInfo(
