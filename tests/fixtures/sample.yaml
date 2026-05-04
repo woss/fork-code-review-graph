@@ -1,0 +1,14 @@
+# Sample YAML file for testing
+# YAML is a data format, so we mainly test that it parses without errors
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-config
+  namespace: default
+data:
+  key1: value1
+  key2: value2
+  nested:
+    setting1: enabled
+    setting2: disabled

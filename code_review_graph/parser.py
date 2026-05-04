@@ -125,6 +125,12 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".res": "rescript",
     ".resi": "rescript",
     ".gd": "gdscript",
+    # DevOps languages
+    ".tf": "terraform",
+    ".tfvars": "terraform",
+    ".hcl": "hcl",
+    ".yaml": "yaml",
+    ".yml": "yaml",
 }
 
 # Tree-sitter node type mappings per language
@@ -172,6 +178,9 @@ _CLASS_TYPES: dict[str, list[str]] = {
     "zig": ["container_declaration"],
     "powershell": ["class_statement"],
     "julia": ["struct_definition", "abstract_definition"],
+    # Terraform/HCL
+    "terraform": ["resource", "module", "data"],
+    "hcl": ["resource", "module", "data"],
 }
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
@@ -222,6 +231,9 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
         "function_definition",
         "short_function_definition",
     ],
+    # Terraform/HCL
+    "terraform": ["variable", "output", "locals"],
+    "hcl": ["variable", "output", "locals"],
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
@@ -262,6 +274,9 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "powershell": [],
     # Julia: import/using are import_statement nodes.
     "julia": ["import_statement", "using_statement"],
+    # Terraform/HCL: no traditional function calls
+    "terraform": [],
+    "hcl": [],
 }
 
 _CALL_TYPES: dict[str, list[str]] = {
@@ -681,6 +696,49 @@ class CodeParser:
         # ReScript: regex-based parser (no tree-sitter grammar bundled).
         if language == "rescript":
             return self._parse_rescript(path, source)
+
+        # Terraform/HCL: custom block extraction
+        if language in ("terraform", "hcl"):
+            parser = self._get_parser(language)
+            if not parser:
+                return [], []
+            tree = parser.parse(source)
+            nodes: list[NodeInfo] = []
+            edges: list[EdgeInfo] = []
+            file_path_str = str(path)
+
+            # File node
+            test_file = _is_test_file(file_path_str)
+            nodes.append(NodeInfo(
+                kind="File",
+                name=file_path_str,
+                file_path=file_path_str,
+                line_start=1,
+                line_end=source.count(b"\n") + 1,
+                language=language,
+                is_test=test_file,
+            ))
+
+            # Extract Terraform/HCL blocks
+            self._extract_terraform_blocks(
+                tree, language, file_path_str, nodes, edges,
+            )
+
+            return nodes, edges
+
+        # YAML: data format - just create File node
+        if language == "yaml":
+            file_path_str = str(path)
+            test_file = _is_test_file(file_path_str)
+            return [NodeInfo(
+                kind="File",
+                name=file_path_str,
+                file_path=file_path_str,
+                line_start=1,
+                line_end=source.count(b"\n") + 1,
+                language=language,
+                is_test=test_file,
+            )], []
 
         parser = self._get_parser(language)
         if not parser:
@@ -1797,6 +1855,14 @@ class CodeParser:
                 ):
                     continue
 
+            # --- Terraform/HCL specific extraction ---
+            # Terraform/HCL use a different block structure than other languages.
+            # Handle all extraction in _extract_terraform_blocks which is
+            # called once at the top level, not per-node.
+            if language in ("terraform", "hcl") and _depth == 0:
+                # Only process at depth 0 - the main loop handles recursion
+                continue
+
             # --- Dart call detection (see #87) ---
             # tree-sitter-dart does not wrap calls in a single
             # ``call_expression`` node; instead the pattern is
@@ -2162,6 +2228,184 @@ class CodeParser:
             ))
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Terraform/HCL-specific extraction
+    # ------------------------------------------------------------------
+
+    def _extract_terraform_blocks(
+        self,
+        tree: "tree_sitter.Tree",
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Extract Terraform/HCL blocks and their relationships.
+
+        Walks the AST looking for 'block' nodes (tree-sitter-hcl uses 'block'
+        as the main construct). For each block, examines the block type and
+        extracts appropriate nodes and edges.
+        """
+        root = tree.root_node
+
+        def walk(node) -> None:
+            """Recursively walk the AST to find block nodes."""
+            if node.type == "block":
+                self._process_terraform_block(
+                    node, language, file_path, nodes, edges,
+                )
+            for child in node.children:
+                walk(child)
+
+        walk(root)
+
+    def _process_terraform_block(
+        self,
+        node,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Process a single Terraform/HCL block node."""
+        # Get block type and name parts from the block
+        # Structure varies by block type:
+        # - No labels: terraform { ... }
+        # - One label: variable "name" { ... }
+        # - Two labels: resource "type" "name" { ... }
+        block_type = None
+        block_name_parts = []
+        body_node = None
+
+        for child in node.children:
+            if child.type == "identifier" and block_type is None:
+                block_type = child.text.decode("utf-8", errors="replace")
+            elif child.type == "string_lit" and block_type is not None:
+                # Block names are string literals (tree-sitter-hcl uses "string_lit")
+                name = child.text.decode("utf-8", errors="replace").strip('"\'')
+                block_name_parts.append(name)
+            elif child.type == "body":
+                body_node = child
+
+        if block_type is None:
+            return
+
+        # Process block body for attributes (like source in modules)
+        if body_node is not None:
+            self._process_terraform_block_body(
+                body_node, block_type, block_name_parts,
+                language, file_path, nodes, edges,
+            )
+
+        # Build qualified block name
+        # For resource blocks: "resource.aws_instance.main"
+        # For variable blocks: "variable.vpc_name"
+        full_name = block_type
+        if block_name_parts:
+            full_name = f"{block_type}.{'.'.join(block_name_parts)}"
+
+        line_start = node.start_point[0] + 1
+        line_end = node.end_point[0] + 1
+
+        # Determine node kind based on block type
+        # Add terraform_kind to extra for downstream queries
+        extra = {"terraform_kind": block_type}
+
+        if block_type in ("resource", "module", "data"):
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=full_name,
+                file_path=file_path,
+                line_start=line_start,
+                line_end=line_end,
+                language=language,
+                extra=extra,
+            ))
+            # CONTAINS edge from file to block
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path,
+                target=f"{file_path}::{full_name}",
+                file_path=file_path,
+                line=line_start,
+            ))
+        elif block_type in ("variable", "output", "locals"):
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=full_name,
+                file_path=file_path,
+                line_start=line_start,
+                line_end=line_end,
+                language=language,
+                extra=extra,
+            ))
+            # CONTAINS edge from file to block
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path,
+                target=f"{file_path}::{full_name}",
+                file_path=file_path,
+                line=line_start,
+            ))
+
+    def _process_terraform_block_body(
+        self,
+        body_node,
+        block_type: Optional[str],
+        block_name_parts: list[str],
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Process a Terraform/HCL block body to extract attributes."""
+        if block_type != "module":
+            return
+
+        # For module blocks, look for source attribute
+        for child in body_node.children:
+            if child.type == "attribute":
+                attr_name = None
+                attr_value = None
+                for sub in child.children:
+                    if sub.type == "identifier" and attr_name is None:
+                        attr_name = sub.text.decode("utf-8", errors="replace")
+                    elif sub.type == "expression" and attr_name == "source":
+                        # Get the literal value from expression
+                        # Handle both direct string_literal and nested structures
+                        attr_value = self._extract_terraform_string_value(sub)
+                
+                if attr_name == "source" and attr_value:
+                    # Create IMPORTS_FROM edge for module source
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=attr_value,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                    ))
+
+    def _extract_terraform_string_value(self, expression_node) -> Optional[str]:
+        """Extract string value from a Terraform/HCL expression node.
+
+        Handles various tree-sitter-hcl structures:
+        - Direct string_lit: expression > literal_value > string_lit
+        - Nested expressions and other structures
+
+        Returns the stripped string value or None if not a string literal.
+        """
+        # Walk the expression node to find string_lit (tree-sitter-hcl node type)
+        def find_string_lit(node):
+            if node.type == "string_lit":
+                return node.text.decode("utf-8", errors="replace").strip('"\'')
+            for child in node.children:
+                result = find_string_lit(child)
+                if result is not None:
+                    return result
+            return None
+
+        return find_string_lit(expression_node)
 
     def _extract_dart_calls_from_children(
         self,
